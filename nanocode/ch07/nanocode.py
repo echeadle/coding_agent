@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import requests
 from dotenv import load_dotenv
@@ -149,6 +150,7 @@ class Claude(Brain):
     def __init__(self, memory=None, tools=None):
         self.memory = memory
         self.tools = tools or []
+        self.system = None
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in .env")
@@ -170,8 +172,8 @@ class Claude(Brain):
             },
             "messages": conversation
         }
-        if self.memory:
-            payload["system"] = self.memory.content
+        if self.system:
+            payload["system"] = self.system
         if self.tools:
             payload["tools"] = self.tools
 
@@ -185,6 +187,7 @@ class DeepSeek(Brain):
     def __init__(self, memory=None, tools=None):
         self.memory = memory
         self.tools = tools or []
+        self.system = None
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not found in .env")
@@ -202,8 +205,8 @@ class DeepSeek(Brain):
             "max_tokens": 4096,
             "messages": conversation
         }
-        if self.memory:
-            payload["system"] = self.memory.content
+        if self.system:
+            payload["system"] = self.system
         if self.tools:
             payload["tools"] = self.tools
 
@@ -223,6 +226,7 @@ BRAINS = {
 class ReadFile:
     """Reads a file from the filesystem."""
     name = "read_file"
+    plan_safe = True
     description = "Reads a file from the filesystem. Use this to examine code."
     input_schema = {
         "type": "object",
@@ -246,7 +250,8 @@ class ReadFile:
 class WriteFile:
     """Writes content to a file."""
     name = "write_file"
-    description = "Writes content to a file. OVERWRITES existing content."
+    plan_safe = False
+    description = "Writes content to a file."
     input_schema = {
         "type": "object",
         "properties": {
@@ -266,9 +271,33 @@ class WriteFile:
             return f"Error writing file: {e}"
 
 
+class WritePlan:
+    """Saves a plan to PLAN.md."""
+    name = "write_plan"
+    plan_safe = True
+    description = "Saves a plan to PLAN.md. Use this to outline your approach before making changes."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "The plan content in markdown"}
+        },
+        "required": ["content"]
+    }
+
+    def execute(self, context, content):
+        print("  → Writing PLAN.md")
+        try:
+            with open("PLAN.md", 'w', encoding='utf-8') as f:
+                f.write(content)
+            return "Plan saved to PLAN.md"
+        except Exception as e:
+            return f"Error saving plan: {e}"
+
+
 class SaveMemory:
     """Updates the agent's internal memory/scratchpad."""
     name = "save_memory"
+    plan_safe = True
     description = "Updates your internal memory/scratchpad. Use this to remember user preferences."
     input_schema = {
         "type": "object",
@@ -303,20 +332,39 @@ def tool_definitions(tools):
 
 # --- Tools List ---
 
-tools = [ReadFile(), WriteFile(), SaveMemory()]
+tools = [ReadFile(), WritePlan(), SaveMemory(), WriteFile()]
 
 
 # --- Agent Class ---
 
 class Agent:
-    """A coding agent with tools and memory."""
+    """A coding agent with tools, memory, and safety mode."""
 
-    def __init__(self, brain, tools, memory=None, brain_name="claude"):
+    def __init__(self, brain, tools, memory=None, mode="plan", brain_name="claude"):
         self.brain = brain
         self.tools = list(tools)  # Copy the tools list
         self.memory = memory
+        self.mode = mode  # "plan" or "act"
         self.brain_name = brain_name
         self.conversation = []
+        self.brain.tools = self._tools_for_mode()
+        self.brain.system = self._build_system_prompt()
+
+    def _build_system_prompt(self):
+        """Build system prompt from memory and current mode."""
+        parts = [self.memory.content] if self.memory else []
+        if self.mode == "plan":
+            parts.append(
+                "You are in PLAN mode. You cannot write code files. "
+                "Use write_plan to save your plans to PLAN.md."
+            )
+        return "\n".join(parts)
+
+    def _tools_for_mode(self):
+        """Return tool definitions based on current mode."""
+        if self.mode == "act":
+            return tool_definitions(self.tools)
+        return tool_definitions([t for t in self.tools if t.plan_safe])
 
     def handle_input(self, user_input):
         """Handle user input. Returns output string, raises AgentStop to quit."""
@@ -329,6 +377,10 @@ class Agent:
         if not user_input.strip():
             return ""
 
+        # Handle mode switching
+        if user_input.strip().startswith("/mode"):
+            return self._handle_mode_command(user_input)
+
         self.conversation.append({"role": "user", "content": user_input})
 
         try:
@@ -336,6 +388,20 @@ class Agent:
         except Exception as e:
             self.conversation.pop()  # Remove failed user message
             return f"Error: {e}"
+
+    def _handle_mode_command(self, user_input):
+        """Handle /mode command to switch between plan and act."""
+        parts = user_input.strip().split()
+        if len(parts) > 1 and parts[1] == "act":
+            self.mode = "act"
+            self.brain.tools = self._tools_for_mode()
+            self.brain.system = self._build_system_prompt()
+            return "⚠️  Switched to ACT MODE (Writing Enabled)"
+        else:
+            self.mode = "plan"
+            self.brain.tools = self._tools_for_mode()
+            self.brain.system = self._build_system_prompt()
+            return "🛡️  Switched to PLAN MODE (Code Read-Only)"
 
     def _agentic_loop(self):
         """Process brain responses, executing tools until done."""
@@ -394,7 +460,8 @@ class Agent:
         new_name = names[(idx + 1) % len(names)]
 
         try:
-            self.brain = BRAINS[new_name](memory=self.memory, tools=tool_definitions(self.tools))
+            self.brain = BRAINS[new_name](memory=self.memory, tools=self._tools_for_mode())
+            self.brain.system = self._build_system_prompt()
             self.brain_name = new_name
             return f"Switched to: {new_name}"
         except ValueError as e:
@@ -404,18 +471,25 @@ class Agent:
 # --- Main Loop ---
 
 def main():
+    # Parse mode from CLI
+    mode = "act" if len(sys.argv) > 1 and sys.argv[1] == "--act" else "plan"
     brain_name = os.getenv("NANOCODE_BRAIN", "claude")
+
     memory = Memory()
     brain = BRAINS[brain_name](memory=memory, tools=tool_definitions(tools))
-    agent = Agent(brain=brain, tools=tools, memory=memory, brain_name=brain_name)
+    agent = Agent(brain=brain, tools=tools, memory=memory, mode=mode, brain_name=brain_name)
 
-    print(f"⚡ Nanocode v0.5 (Memory Enabled)")
-    print(f"Commands: /q quit, /switch toggle brain")
+    print(f"⚡ Nanocode v0.6")
+    print(f"Commands: /q quit, /switch toggle brain, /mode [plan|act]")
     print(f"Brain: {brain_name}")
+    if mode == "act":
+        print("Mode: ACT (Writing Enabled)")
+    else:
+        print("Mode: PLAN (Code Read-Only)")
 
     while True:
         try:
-            user_input = input(f"[{agent.brain_name}] ❯ ")
+            user_input = input(f"[{agent.brain_name}:{agent.mode}] ❯ ")
             output = agent.handle_input(user_input)
             if output:
                 print(f"\n{output}\n")

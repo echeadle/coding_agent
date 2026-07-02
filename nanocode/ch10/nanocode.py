@@ -1,11 +1,13 @@
 import os
+import sys
+import subprocess
 import time
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-
+# --- Edward
 # --- HTTP Helpers ---
 
 def request_with_retry(url, headers, payload, max_retries=10):
@@ -112,6 +114,8 @@ class ToolContext:
 
 class Brain:
     """Base class for LLM providers."""
+    context_limit = 200_000  # Subclasses override as needed
+    last_input_tokens = 0    # Updated after each think() call
 
     def think(self, conversation):
         """Process conversation, return Thought."""
@@ -149,6 +153,7 @@ class Claude(Brain):
     def __init__(self, memory=None, tools=None):
         self.memory = memory
         self.tools = tools or []
+        self.system = None
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in .env")
@@ -170,21 +175,25 @@ class Claude(Brain):
             },
             "messages": conversation
         }
-        if self.memory:
-            payload["system"] = self.memory.content
+        if self.system:
+            payload["system"] = self.system
         if self.tools:
             payload["tools"] = self.tools
 
         response = request_with_retry(self.url, headers, payload)
-        return self._parse_response(response.json()["content"])
+        data = response.json()
+        self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
+        return self._parse_response(data["content"])
 
 
 class DeepSeek(Brain):
     """DeepSeek API (Anthropic-compatible, with tool support)."""
+    context_limit = 128_000
 
     def __init__(self, memory=None, tools=None):
         self.memory = memory
         self.tools = tools or []
+        self.system = None
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not found in .env")
@@ -202,27 +211,77 @@ class DeepSeek(Brain):
             "max_tokens": 4096,
             "messages": conversation
         }
-        if self.memory:
-            payload["system"] = self.memory.content
+        if self.system:
+            payload["system"] = self.system
         if self.tools:
             payload["tools"] = self.tools
 
         response = request_with_retry(self.url, headers, payload)
-        return self._parse_response(response.json()["content"])
+        data = response.json()
+        self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
+        return self._parse_response(data["content"])
 
+class Ollama(Brain):
+    """Ollama local model (Anthropic-compatible API, with tool support.)"""
+    context_limit = 32_768
+    
+    def __init__(self, memory=None, tools=None):
+        self.memory = memory
+        self.tools = tools or []
+        self.system = None
+        self.model = os.getenv("OLLAMA_MODEL", "qwen3.5:27b/")
+        self.url = "http://localhost:11434/v1/messages"
+        self._detect_context_limit()
 
+    def _detect_context_limit(self):
+        """Query Ollama for the model's context window size."""
+        try:
+            response = requests.post(
+                "http://localhost:11434/api/show",
+                json={"model": self.model},
+                timeout=2
+            )
+            model_info = response.json().get("model_info", {})
+            for key, value in model_info.item():
+                self.context_limit = value
+                return
+        except Exception:
+            pass # Keep default
+        
+    def think(self, conversation):
+        headers = {
+            "x-api-key": "ollama",  # Required but not validated
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        payload = {
+            "model": self.model,
+            "max_tokens": 4096,
+            "messages": conversation
+        }
+        if self.system:
+            payload["system"] = self.system
+        if self.tools:
+            payload["tools"] = self.tools
+
+        response = request_with_retry(self.url, headers, payload)
+        data = response.json()
+        self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
+        return self._parse_response(data["content"])
+    
 # Available brains
 BRAINS = {
     "claude": Claude,
     "deepseek": DeepSeek,
+    "ollama": Ollama,
 }
-
 
 # --- Tool Classes ---
 
 class ReadFile:
     """Reads a file from the filesystem."""
     name = "read_file"
+    plan_safe = True
     description = "Reads a file from the filesystem. Use this to examine code."
     input_schema = {
         "type": "object",
@@ -246,7 +305,8 @@ class ReadFile:
 class WriteFile:
     """Writes content to a file."""
     name = "write_file"
-    description = "Writes content to a file. OVERWRITES existing content."
+    plan_safe = False
+    description = "Writes content to a file."
     input_schema = {
         "type": "object",
         "properties": {
@@ -266,9 +326,130 @@ class WriteFile:
             return f"Error writing file: {e}"
 
 
+class WritePlan:
+    """Saves a plan to PLAN.md."""
+    name = "write_plan"
+    plan_safe = True
+    description = "Saves a plan to PLAN.md. Use this to outline your approach before making changes."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "The plan content in markdown"}
+        },
+        "required": ["content"]
+    }
+
+    def execute(self, context, content):
+        print("  → Writing PLAN.md")
+        try:
+            with open("PLAN.md", 'w', encoding='utf-8') as f:
+                f.write(content)
+            return "Plan saved to PLAN.md"
+        except Exception as e:
+            return f"Error saving plan: {e}"
+
+
+class EditFile:
+    """Replaces text in a file (surgical edit)."""
+    name = "edit_file"
+    plan_safe = False
+    description = "Replaces specific text in a file. Use for surgical edits instead of rewriting entire files."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file"},
+            "old_text": {"type": "string", "description": "Exact text to find and replace"},
+            "new_text": {"type": "string", "description": "Text to replace it with"}
+        },
+        "required": ["path", "old_text", "new_text"]
+    }
+
+    def execute(self, context, path, old_text, new_text):
+        print(f"  → Editing {path}")
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            if old_text not in content:
+                return f"Error: Could not find the specified text in {path}"
+            new_content = content.replace(old_text, new_text, 1)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            return f"Successfully edited {path}"
+        except Exception as e:
+            return f"Error editing file: {e}"
+
+
+class ListFiles:
+    """Lists files in the project structure."""
+    name = "list_files"
+    plan_safe = True
+    description = "Lists all files in the project structure. Useful to understand the project layout."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "The root path (default '.')"}
+        }
+    }
+
+    def execute(self, context, path="."):
+        print(f"  → Listing {path}")
+        try:
+            file_list = []
+            for root, dirs, files in os.walk(path):
+                dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "venv", ".nanocode"}]
+
+                level = root.replace(path, '').count(os.sep)
+                indent = ' ' * 4 * (level)
+                file_list.append(f"{indent}{os.path.basename(root)}/")
+                subindent = ' ' * 4 * (level + 1)
+                for f in files:
+                    file_list.append(f"{subindent}{f}")
+
+            return "\n".join(file_list)
+        except Exception as e:
+            return f"Error listing files: {e}"
+
+
+class SearchCodebase:
+    """Searches for a string in all files."""
+    name = "search_codebase"
+    plan_safe = True
+    description = "Searches the entire codebase for a text string. Useful to find where functions or variables are defined."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The string to search for"},
+            "path": {"type": "string", "description": "The root path (default '.')"}
+        },
+        "required": ["query"]
+    }
+
+    def execute(self, context, query, path="."):
+        print(f"  → Searching for '{query}'")
+        results = []
+        try:
+            for root, dirs, files in os.walk(path):
+                dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "venv", ".nanocode"}]
+
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            for i, line in enumerate(f):
+                                if query.lower() in line.lower():
+                                    results.append(f"{file_path}:{i+1}: {line.strip()}")
+                    except Exception:
+                        continue
+
+            return "\n".join(results) if results else "No matches found."
+        except Exception as e:
+            return f"Error searching: {e}"
+
+
 class SaveMemory:
     """Updates the agent's internal memory/scratchpad."""
     name = "save_memory"
+    plan_safe = True
     description = "Updates your internal memory/scratchpad. Use this to remember user preferences."
     input_schema = {
         "type": "object",
@@ -284,6 +465,47 @@ class SaveMemory:
             return "Error: Memory not available"
         context.memory.save(content)
         return "Memory updated successfully."
+
+
+class RunCommand:
+    """Executes shell commands."""
+    name = "run_command"
+    plan_safe = False
+    description = "Executes a terminal command. Use this to run scripts, tests, or install packages."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "The shell command to run (e.g., 'python test.py')"}
+        },
+        "required": ["command"]
+    }
+
+    def execute(self, context, command):
+        print(f"  → Running: {command[:50]}...")
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=int(os.environ.get("NANOCODE_TIMEOUT", "30")),
+                cwd=os.getcwd()
+            )
+
+            output = ""
+            if result.stdout:
+                output += f"STDOUT:\n{result.stdout}\n"
+            if result.stderr:
+                output += f"STDERR:\n{result.stderr}\n"
+            if not output:
+                output = "(No output)"
+
+            return output.strip()
+
+        except subprocess.TimeoutExpired:
+            return "Error: Command timed out."
+        except Exception as e:
+            return f"Error executing command: {e}"
 
 
 # --- Tool Helpers ---
@@ -303,20 +525,39 @@ def tool_definitions(tools):
 
 # --- Tools List ---
 
-tools = [ReadFile(), WriteFile(), SaveMemory()]
+tools = [ReadFile(), WritePlan(), SaveMemory(), ListFiles(), SearchCodebase(), WriteFile(), EditFile(), RunCommand()]
 
 
 # --- Agent Class ---
 
 class Agent:
-    """A coding agent with tools and memory."""
+    """A coding agent with tools, memory, and safety mode."""
 
-    def __init__(self, brain, tools, memory=None, brain_name="claude"):
+    def __init__(self, brain, tools, memory=None, mode="plan", brain_name="claude"):
         self.brain = brain
         self.tools = list(tools)  # Copy the tools list
         self.memory = memory
+        self.mode = mode  # "plan" or "act"
         self.brain_name = brain_name
         self.conversation = []
+        self.brain.tools = self._tools_for_mode()
+        self.brain.system = self._build_system_prompt()
+
+    def _build_system_prompt(self):
+        """Build system prompt from memory and current mode."""
+        parts = [self.memory.content] if self.memory else []
+        if self.mode == "plan":
+            parts.append(
+                "You are in PLAN mode. You cannot write code files. "
+                "Use write_plan to save your plans to PLAN.md."
+            )
+        return "\n".join(parts)
+
+    def _tools_for_mode(self):
+        """Return tool definitions based on current mode."""
+        if self.mode == "act":
+            return tool_definitions(self.tools)
+        return tool_definitions([t for t in self.tools if t.plan_safe])
 
     def handle_input(self, user_input):
         """Handle user input. Returns output string, raises AgentStop to quit."""
@@ -329,6 +570,10 @@ class Agent:
         if not user_input.strip():
             return ""
 
+        # Handle mode switching
+        if user_input.strip().startswith("/mode"):
+            return self._handle_mode_command(user_input)
+
         self.conversation.append({"role": "user", "content": user_input})
 
         try:
@@ -337,11 +582,26 @@ class Agent:
             self.conversation.pop()  # Remove failed user message
             return f"Error: {e}"
 
+    def _handle_mode_command(self, user_input):
+        """Handle /mode command to switch between plan and act."""
+        parts = user_input.strip().split()
+        if len(parts) > 1 and parts[1] == "act":
+            self.mode = "act"
+            self.brain.tools = self._tools_for_mode()
+            self.brain.system = self._build_system_prompt()
+            return "⚠️  Switched to ACT MODE (Writing Enabled)"
+        else:
+            self.mode = "plan"
+            self.brain.tools = self._tools_for_mode()
+            self.brain.system = self._build_system_prompt()
+            return "🛡️  Switched to PLAN MODE (Code Read-Only)"
+
     def _agentic_loop(self):
         """Process brain responses, executing tools until done."""
         output_parts = []
+        max_iterations = 50
 
-        while True:
+        for _iteration in range(max_iterations):
             thought = self.brain.think(self.conversation)
 
             # Display thinking
@@ -350,6 +610,10 @@ class Agent:
                 for i, line in enumerate(lines):
                     prefix = "  💭 " if i == 0 else "     "
                     print(f"\033[2m{prefix}{line}\033[0m")
+
+            # Compact if approaching context limit
+            if self.brain.last_input_tokens > self.brain.context_limit * 0.75:
+                self._compact_conversation()
 
             # Store raw content for message history
             self.conversation.append({"role": "assistant", "content": thought.raw_content})
@@ -373,8 +637,33 @@ class Agent:
                 })
 
             self.conversation.append({"role": "user", "content": tool_results})
+        else:
+            output_parts.append("(Stopped: too many iterations)")
 
         return "\n".join(output_parts)
+
+    def _compact_conversation(self):
+        """Summarize old messages to stay within context limits."""
+        print("(Compacting conversation...)")
+        history = "\n".join(
+            f"{m['role']}: {str(m['content'])[:500]}"
+            for m in self.conversation
+        )
+        prompt = [{
+            "role": "user",
+            "content": f"Summarize this conversation for continuity. "
+                       f"Focus on what was accomplished, what's in progress, "
+                       f"and key decisions:\n\n{history}"
+        }]
+        saved_tools = self.brain.tools
+        self.brain.tools = []
+        try:
+            thought = self.brain.think(prompt)
+        finally:
+            self.brain.tools = saved_tools
+        self.conversation = [
+            {"role": "user", "content": f"Previous conversation summary: {thought.text}"},
+        ]
 
     def _execute_tool(self, name, args):
         """Execute a tool by name with given arguments."""
@@ -394,7 +683,8 @@ class Agent:
         new_name = names[(idx + 1) % len(names)]
 
         try:
-            self.brain = BRAINS[new_name](memory=self.memory, tools=tool_definitions(self.tools))
+            self.brain = BRAINS[new_name](memory=self.memory, tools=self._tools_for_mode())
+            self.brain.system = self._build_system_prompt()
             self.brain_name = new_name
             return f"Switched to: {new_name}"
         except ValueError as e:
@@ -404,18 +694,25 @@ class Agent:
 # --- Main Loop ---
 
 def main():
+    # Parse mode from CLI
+    mode = "act" if len(sys.argv) > 1 and sys.argv[1] == "--act" else "plan"
     brain_name = os.getenv("NANOCODE_BRAIN", "claude")
+
     memory = Memory()
     brain = BRAINS[brain_name](memory=memory, tools=tool_definitions(tools))
-    agent = Agent(brain=brain, tools=tools, memory=memory, brain_name=brain_name)
+    agent = Agent(brain=brain, tools=tools, memory=memory, mode=mode, brain_name=brain_name)
 
-    print(f"⚡ Nanocode v0.5 (Memory Enabled)")
-    print(f"Commands: /q quit, /switch toggle brain")
+    print(f"⚡ Nanocode v0.8")
+    print(f"Commands: /q quit, /switch toggle brain, /mode [plan|act]")
     print(f"Brain: {brain_name}")
+    if mode == "act":
+        print("Mode: ACT (Writing Enabled)")
+    else:
+        print("Mode: PLAN (Code Read-Only)")
 
     while True:
         try:
-            user_input = input(f"[{agent.brain_name}] ❯ ")
+            user_input = input(f"[{agent.brain_name}:{agent.mode}] ❯ ")
             output = agent.handle_input(user_input)
             if output:
                 print(f"\n{output}\n")
