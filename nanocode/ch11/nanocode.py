@@ -3,6 +3,7 @@ import sys
 import subprocess
 import time
 import requests
+from html.parser import HTMLParser
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -508,6 +509,98 @@ class RunCommand:
             return f"Error executing command: {e}"
 
 
+class _DDGParser(HTMLParser):
+    """Minimal HTML parser that extracts DuckDuckGo result titles, URLs, and snippets."""
+
+    def __init__(self):
+        super().__init__()
+        self.results = []          # list of {"title": ..., "url": ..., "snippet": ...}
+        self._current: dict | None = None
+        self._capture_title = False
+        self._capture_snippet = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        css = attrs.get("class", "")
+        if tag == "a" and "result__a" in css:
+            href = attrs.get("href", "")
+            self._current = {"title": "", "url": href, "snippet": ""}
+            self._capture_title = True
+        elif tag == "a" and "result__snippet" in css:
+            self._capture_snippet = True
+
+    def handle_endtag(self, tag):
+        if tag == "a":
+            if self._capture_title:
+                self._capture_title = False
+                if self._current:
+                    self.results.append(self._current)
+            if self._capture_snippet:
+                self._capture_snippet = False
+
+    def handle_data(self, data):
+        if self._capture_title and self._current is not None:
+            self._current["title"] += data
+        elif self._capture_snippet and self._current is not None:
+            self._current["snippet"] += data
+
+
+class SearchWeb:
+    """Searches the web using DuckDuckGo and returns titles, URLs, and snippets."""
+    name = "search_web"
+    plan_safe = True
+    description = "Searches the web using DuckDuckGo. Returns titles, URLs, and snippets for the top results."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The search query"},
+            "max_results": {"type": "integer", "description": "Maximum number of results to return (default 5)"}
+        },
+        "required": ["query"]
+    }
+
+    _DDG_URL = "https://html.duckduckgo.com/html/"
+    _HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    def execute(self, context, query, max_results=5):
+        print(f"  → Searching web for '{query}'")
+        try:
+            response = requests.get(
+                self._DDG_URL,
+                params={"q": query},
+                headers=self._HEADERS,
+                timeout=15,
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            return f"Error: Web search failed - {e}"
+
+        parser = _DDGParser()
+        parser.feed(response.text)
+
+        hits = parser.results[:max_results]
+        if not hits:
+            return "No results found."
+
+        lines = []
+        for i, hit in enumerate(hits, 1):
+            title = hit["title"].strip() or "(no title)"
+            url = hit["url"].strip()
+            snippet = hit["snippet"].strip()
+            lines.append(f"{i}. **{title}**")
+            lines.append(f"   {url}")
+            if snippet:
+                lines.append(f"   {snippet}")
+        return "\n".join(lines)
+
+
 # --- Tool Helpers ---
 
 def get_tool(tools, name):
@@ -525,7 +618,7 @@ def tool_definitions(tools):
 
 # --- Tools List ---
 
-tools = [ReadFile(), WritePlan(), SaveMemory(), ListFiles(), SearchCodebase(), WriteFile(), EditFile(), RunCommand()]
+tools = [ReadFile(), WritePlan(), SaveMemory(), ListFiles(), SearchCodebase(), WriteFile(), EditFile(), RunCommand(), SearchWeb()]
 
 
 # --- Agent Class ---
